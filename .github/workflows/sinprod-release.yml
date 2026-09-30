@@ -1,0 +1,160 @@
+name: SINPROD - Build e Release
+
+# A cada push na branch sinprod: compila o FlameRobin (Windows x64), monta o zip
+# portatil e publica como Release. O time baixa sempre o Release marcado "Latest".
+
+on:
+  push:
+    branches: [ "sinprod" ]
+  workflow_dispatch:
+
+concurrency:
+  group: sinprod-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASES_A_MANTER: 10
+
+jobs:
+  build:
+    name: Build Windows x64 e publicar release
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Ambiente MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Bootstrap vcpkg
+      shell: pwsh
+      run: |
+        .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+        echo "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
+
+    - name: Cache binarios do vcpkg
+      uses: actions/cache@v4
+      with:
+        path: vcpkg_archives
+        key: ${{ runner.os }}-vcpkg-bin-sinprod-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-bin-sinprod-
+
+    - name: Instalar dependencias (vcpkg)
+      shell: pwsh
+      env:
+        VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg_archives
+      run: |
+        if (!(Test-Path vcpkg_archives)) { New-Item -ItemType Directory -Path vcpkg_archives }
+        $ok = $false
+        for ($i = 1; $i -le 3; $i++) {
+          & .\vcpkg\vcpkg.exe install --triplet x64-windows-static
+          if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+          Write-Host "vcpkg install falhou, nova tentativa em 10 s..."
+          Start-Sleep -Seconds 10
+        }
+        if (-not $ok) { Write-Error "vcpkg install falhou apos 3 tentativas"; exit 1 }
+
+    - name: Gerar src/revisioninfo.h
+      shell: cmd
+      run: .\update-revision-info.cmd
+
+    - name: Configurar CMake
+      shell: pwsh
+      env:
+        VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg_archives
+      run: |
+        cmake -S .\ -B .\build64 -A x64 "-DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_INSTALLED_DIR="${{ github.workspace }}\vcpkg_installed"
+
+    - name: Compilar (somente o alvo flamerobin)
+      shell: pwsh
+      run: cmake --build .\build64 --config Release --target flamerobin -j 8
+
+    - name: Baixar cliente Firebird 5.0.4
+      shell: pwsh
+      run: |
+        $url = "https://github.com/FirebirdSQL/firebird/releases/download/v5.0.4/Firebird-5.0.4.1812-0-windows-x64.zip"
+        [System.Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $url -OutFile firebird-x64.zip
+        Expand-Archive -Path firebird-x64.zip -DestinationPath firebird-x64-extracted -Force
+
+    - name: Montar pacote portatil
+      shell: pwsh
+      run: |
+        $v = Get-Content src/frversion.h -Raw
+        $major = [regex]::Match($v, '#define\s+FR_VERSION_MAJOR\s+(\d+)').Groups[1].Value
+        $minor = [regex]::Match($v, '#define\s+FR_VERSION_MINOR\s+(\d+)').Groups[1].Value
+        $rls   = [regex]::Match($v, '#define\s+FR_VERSION_RLS\s+(\d+)').Groups[1].Value
+        $version = "$major.$minor.$rls"
+        $sha  = "${{ github.sha }}".Substring(0, 7)
+        $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmm")
+        "FR_VERSION=$version" >> $env:GITHUB_ENV
+        "FR_TAG=sinprod-$stamp-$sha" >> $env:GITHUB_ENV
+        "FR_SHA=$sha" >> $env:GITHUB_ENV
+
+        $fb = "firebird-x64-extracted"
+        $stage = "flamerobin-sinprod-$version-win-x64"
+        if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+        New-Item -ItemType Directory -Path $stage | Out-Null
+
+        Copy-Item build64\Release\flamerobin.exe $stage\
+        foreach ($d in "docs","conf-defs","code-templates","html-templates","sys-templates","xml-styles") {
+          if (Test-Path $d) { Copy-Item $d $stage\ -Recurse -Force }
+        }
+        New-Item -ItemType Directory -Path $stage\images | Out-Null
+        Copy-Item build64\images\* $stage\images\ -Recurse -Force
+
+        Copy-Item $fb\fbclient.dll, $fb\ib_util.dll, $fb\firebird.conf $stage\ -Force
+        Get-ChildItem $fb -Filter "icu*" | Copy-Item -Destination $stage\ -Force
+        foreach ($p in "msvcp140*.dll","vcruntime140*.dll","vcomp140*.dll") {
+          Get-ChildItem $fb -Filter $p | Copy-Item -Destination $stage\ -Force
+        }
+        New-Item -ItemType Directory -Path $stage\plugins | Out-Null
+        foreach ($p in "srp.dll","legacy_auth.dll","legacy_usermanager.dll") {
+          Copy-Item $fb\plugins\$p $stage\plugins\ -Force
+        }
+        New-Item -ItemType Directory -Path $stage\intl | Out-Null
+        Copy-Item $fb\intl\fbintl.dll, $fb\intl\fbintl.conf $stage\intl\ -Force
+
+        # Deixa gravado de qual commit saiu o pacote.
+        "FlameRobin SINPROD $version`ncommit: ${{ github.sha }}`nbranch: ${{ github.ref_name }}" |
+          Set-Content $stage\VERSAO-SINPROD.txt
+
+        $zip = "$stage.zip"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        Compress-Archive -Path $stage -DestinationPath $zip -Force
+        "FR_ZIP=$zip" >> $env:GITHUB_ENV
+
+    - name: Publicar release
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $notes = "Build automático da branch sinprod, commit $env:FR_SHA.`n`nBaixe o zip, extraia em qualquer pasta e execute flamerobin.exe (não precisa instalar).`n`nCommit: ${{ github.sha }}"
+        gh release create $env:FR_TAG $env:FR_ZIP --target ${{ github.sha }} --latest --title "FlameRobin SINPROD $env:FR_VERSION ($env:FR_SHA)" --notes $notes
+
+    - name: Limpar releases antigos
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $keep = [int]$env:RELEASES_A_MANTER
+        $tags = gh release list --limit 100 --json tagName,createdAt |
+          ConvertFrom-Json |
+          Where-Object { $_.tagName -like 'sinprod-*' } |
+          Sort-Object createdAt -Descending |
+          Select-Object -Skip $keep
+        foreach ($t in $tags) {
+          Write-Host "Removendo release antigo $($t.tagName)"
+          gh release delete $t.tagName --cleanup-tag --yes
+        }
